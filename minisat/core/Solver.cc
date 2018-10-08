@@ -366,7 +366,7 @@ void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
     // Find correct backtrack level:
     //
     if (out_learnt.size() == 1)
-        out_btlevel = 0;
+        out_btlevel = 1;
     else{
         int max_i = 1;
         // Find the first literal assigned at the next-highest level:
@@ -498,8 +498,8 @@ void Solver::analyzeFinal2(CRef confl, LSet& out_conflict)
         Var x = var(trail[i]);
         if (seen[x]){
             if (reason(x) == CRef_Undef){
-                assert(level(x) > 0);
-                out_conflict.insert(~trail[i]);
+                if (level(x) > 0)
+                    out_conflict.insert(~trail[i]);
             }else{
                 Clause& c = ca[reason(x)];
                 for (int j = 1; j < c.size(); j++)
@@ -523,6 +523,14 @@ void Solver::uncheckedEnqueue(Lit p, CRef from)
     trail.push_(p);
 }
 
+void Solver::uncheckedEnqueueZero(Lit p)
+{
+    assert(value(p) == l_Undef);
+    assigns[var(p)] = lbool(!sign(p));
+    vardata[var(p)] = mkVarData(CRef_Undef, 0);
+    trail.push_(p);
+    levelZeroUnits.push(p);
+}
 
 /*_________________________________________________________________________________________________
 |
@@ -595,6 +603,76 @@ CRef Solver::propagate()
     return confl;
 }
 
+CRef Solver::propagate2()
+{
+    CRef    confl     = CRef_Undef;
+    int     num_props = 0;
+    
+    while (qhead < trail.size()){
+        Lit            p   = trail[qhead++];     // 'p' is enqueued fact to propagate.
+        vec<Watcher>&  ws  = watches.lookup(p);
+        Watcher        *i, *j, *end;
+        num_props++;
+        
+        for (i = j = (Watcher*)ws, end = i + ws.size();  i != end;){
+            // Try to avoid inspecting the clause:
+            Lit blocker = i->blocker;
+            if (value(blocker) == l_True){
+                *j++ = *i++; continue; }
+            
+            // Make sure the false literal is data[1]:
+            CRef     cr        = i->cref;
+            Clause&  c         = ca[cr];
+            Lit      false_lit = ~p;
+            if (c[0] == false_lit)
+                c[0] = c[1], c[1] = false_lit;
+            assert(c[1] == false_lit);
+            i++;
+            
+            // If 0th watch is true, then clause is already satisfied.
+            Lit     first = c[0];
+            Watcher w     = Watcher(cr, first);
+            if (first != blocker && value(first) == l_True){
+                *j++ = w; continue; }
+            
+            int nonzeros = 0;
+            // Look for new watch:
+            for (int k = 2; k < c.size(); k++) {
+                if (value(c[k]) != l_False){
+                    c[1] = c[k]; c[k] = false_lit;
+                    watches[~c[1]].push(w);
+                    goto NextClause; }
+                else if (level(var(c[k])) > 0) {
+                    nonzeros++;
+                }
+            }
+            
+            // Did not find watch -- clause is unit under assignment:
+            *j++ = w;
+            if (value(first) == l_False){
+                confl = cr;
+                qhead = trail.size();
+                // Copy the remaining watches:
+                while (i < end)
+                    *j++ = *i++;
+            }else {
+                if (nonzeros > 0 || level(var(c[1])) > 0) {
+                    uncheckedEnqueue(first, cr);
+                }
+                else {
+                    uncheckedEnqueueZero(first);
+                }
+            }
+            
+        NextClause:;
+        }
+        ws.shrink(i - j);
+    }
+    propagations += num_props;
+    simpDB_props -= num_props;
+    
+    return confl;
+}
 
 /*_________________________________________________________________________________________________
 |
@@ -740,7 +818,13 @@ lbool Solver::search(int nof_conflicts)
     starts++;
 
     for (;;){
-        CRef confl = propagate();
+        CRef confl;
+        if (decisionLevel() == 1) {
+            confl = propagate2();
+        }
+        else {
+            confl = propagate();
+        }
         if (confl != CRef_Undef){
             // CONFLICT
             conflicts++; conflictC++;
@@ -755,7 +839,7 @@ lbool Solver::search(int nof_conflicts)
             cancelUntil(backtrack_level);
 
             if (learnt_clause.size() == 1){
-                uncheckedEnqueue(learnt_clause[0]);
+                uncheckedEnqueueZero(learnt_clause[0]);
             }else{
                 CRef cr = ca.alloc(learnt_clause, true);
                 learnts.push(cr);
@@ -876,6 +960,10 @@ static double luby(double y, int x){
 lbool Solver::solve_()
 {
     model.clear();
+    for (int i = 0; i < levelZeroUnits.size(); i++) {
+        uncheckedEnqueue(levelZeroUnits[i]);
+    }
+    levelZeroUnits.clear();
     conflict.clear();
     if (!ok) return l_False;
 
